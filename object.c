@@ -1,4 +1,12 @@
 // object.c — Content-addressable object store
+//
+// Every piece of data (file contents, directory listings, commits) is stored
+// as an "object" named by its SHA-256 hash. Objects are stored under
+// .pes/objects/XX/YYYYYY... where XX is the first two hex characters of the
+// hash (directory sharding).
+//
+// PROVIDED functions: compute_hash, object_path, object_exists, hash_to_hex, hex_to_hash
+// TODO functions:     object_write, object_read
 
 #include "pes.h"
 #include <stdio.h>
@@ -37,6 +45,9 @@ void compute_hash(const void *data, size_t len, ObjectID *id_out) {
     EVP_MD_CTX_free(ctx);
 }
 
+// Get the filesystem path where an object should be stored.
+// Format: .pes/objects/XX/YYYYYYYY...
+// The first 2 hex chars form the shard directory; the rest is the filename.
 void object_path(const ObjectID *id, char *path_out, size_t path_size) {
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id, hex);
@@ -49,152 +60,134 @@ int object_exists(const ObjectID *id) {
     return access(path, F_OK) == 0;
 }
 
-// ─── TODO IMPLEMENTED ────────────────────────────────────────────────────────
+// ─── IMPLEMENTED ─────────────────────────────────────────────────────────────
 
+// Write an object to the store.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    char header[64];
+    // Step 1: Build the header string: "blob 16\0" / "tree 16\0" / "commit 16\0"
     const char *type_str;
+    if (type == OBJ_BLOB)        type_str = "blob";
+    else if (type == OBJ_TREE)   type_str = "tree";
+    else                         type_str = "commit";
 
-    switch (type) {
-        case OBJ_BLOB: type_str = "blob"; break;
-        case OBJ_TREE: type_str = "tree"; break;
-        case OBJ_COMMIT: type_str = "commit"; break;
-        default: return -1;
-    }
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    // header_len does NOT include the null byte, but we need to store it
+    size_t full_len = header_len + 1 + len;  // +1 for the '\0' after the header
 
-    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
-
-    size_t total_len = header_len + len;
-    unsigned char *full = malloc(total_len);
+    // Step 2: Allocate a buffer for header + '\0' + data
+    uint8_t *full = malloc(full_len);
     if (!full) return -1;
-
     memcpy(full, header, header_len);
-    memcpy(full + header_len, data, len);
+    full[header_len] = '\0';                 // the null byte separator
+    memcpy(full + header_len + 1, data, len);
 
-    compute_hash(full, total_len, id_out);
+    // Step 3: Compute SHA-256 of the full object
+    ObjectID id;
+    compute_hash(full, full_len, &id);
 
-    if (object_exists(id_out)) {
+    // Step 4: Check for deduplication — if already stored, return immediately
+    if (object_exists(&id)) {
+        *id_out = id;
         free(full);
         return 0;
     }
 
-    char path[512];
-    object_path(id_out, path, sizeof(path));
+    // Step 5: Create the shard directory (.pes/objects/XX/)
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(&id, hex);
 
-    char dir[512];
-    strncpy(dir, path, sizeof(dir));
-    char *slash = strrchr(dir, '/');
-    if (!slash) {
-        free(full);
-        return -1;
-    }
-    *slash = '\0';
+    char shard_dir[256];
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(shard_dir, 0755);  // OK if it already exists
 
-    mkdir(OBJECTS_DIR, 0755);
-    mkdir(dir, 0755);
+    // Step 6: Get the final object path
+    char obj_path[512];
+    object_path(&id, obj_path, sizeof(obj_path));
 
-    char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s/tmpXXXXXX", dir);
+    // Step 7: Write to a temp file in the same shard directory
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/tmp_XXXXXX", shard_dir);
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) { free(full); return -1; }
 
-    int fd = mkstemp(temp_path);
-    if (fd < 0) {
-        free(full);
-        return -1;
-    }
-
-    if (write(fd, full, total_len) != (ssize_t)total_len) {
+    ssize_t written = write(fd, full, full_len);
+    free(full);
+    if (written < 0 || (size_t)written != full_len) {
         close(fd);
-        unlink(temp_path);
-        free(full);
+        unlink(tmp_path);
         return -1;
     }
 
+    // Step 8: fsync the temp file to ensure data reaches disk
     fsync(fd);
     close(fd);
 
-    if (rename(temp_path, path) != 0) {
-        unlink(temp_path);
-        free(full);
+    // Step 9: Atomically rename temp file to final path
+    if (rename(tmp_path, obj_path) != 0) {
+        unlink(tmp_path);
         return -1;
     }
 
-    int dfd = open(dir, O_RDONLY);
-    if (dfd >= 0) {
-        fsync(dfd);
-        close(dfd);
+    // Step 10: fsync the shard directory to persist the rename
+    int dir_fd = open(shard_dir, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
     }
 
-    free(full);
-    return 0;
-}
-
+    *id_out = id;
+    return 0;}
+// Read an object from the store.
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
+    // Step 1: Get the file path
     char path[512];
     object_path(id, path, sizeof(path));
 
+    // Step 2: Open and read the entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    rewind(f);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-    unsigned char *buffer = malloc(file_size);
-    if (!buffer) {
-        fclose(f);
-        return -1;
-    }
-
-    if (fread(buffer, 1, file_size, f) != (size_t)file_size) {
-        fclose(f);
-        free(buffer);
-        return -1;
+    uint8_t *file_buf = malloc(file_size);
+    if (!file_buf) { fclose(f); return -1; }
+    if (fread(file_buf, 1, file_size, f) != file_size) {
+        fclose(f); free(file_buf); return -1;
     }
     fclose(f);
 
+    // Step 3: Integrity check — recompute hash and compare to filename
     ObjectID computed;
-    compute_hash(buffer, file_size, &computed);
-
+    compute_hash(file_buf, file_size, &computed);
     if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
-        free(buffer);
-        return -1;
+        free(file_buf);
+        return -1; // Corruption detected!
     }
 
-    char *null_pos = memchr(buffer, '\0', file_size);
-    if (!null_pos) {
-        free(buffer);
-        return -1;
-    }
+    // Step 4: Find the \0 that separates header from data
+    uint8_t *null_byte = memchr(file_buf, '\0', file_size);
+    if (!null_byte) { free(file_buf); return -1; }
 
-    size_t header_len = null_pos - (char *)buffer;
+    // Step 5: Parse the type from the header (e.g., "blob 16")
+    if (strncmp((char *)file_buf, "blob", 4) == 0)        *type_out = OBJ_BLOB;
+    else if (strncmp((char *)file_buf, "tree", 4) == 0)   *type_out = OBJ_TREE;
+    else if (strncmp((char *)file_buf, "commit", 6) == 0) *type_out = OBJ_COMMIT;
+    else { free(file_buf); return -1; }
 
-    char type_str[10];
-    size_t size;
+    // Step 6: Extract data portion (everything after the \0)
+    uint8_t *data_start = null_byte + 1;
+    size_t data_len = file_size - (data_start - file_buf);
 
-    if (sscanf((char *)buffer, "%9s %zu", type_str, &size) != 2) {
-        free(buffer);
-        return -1;
-    }
+    uint8_t *out_buf = malloc(data_len);
+    if (!out_buf) { free(file_buf); return -1; }
+    memcpy(out_buf, data_start, data_len);
 
-    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
-    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
-    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
-    else {
-        free(buffer);
-        return -1;
-    }
+    *data_out = out_buf;
+    *len_out = data_len;
 
-    unsigned char *data = malloc(size);
-    if (!data) {
-        free(buffer);
-        return -1;
-    }
-
-    memcpy(data, buffer + header_len + 1, size);
-
-    *data_out = data;
-    *len_out = size;
-
-    free(buffer);
+    free(file_buf);
     return 0;
 }
